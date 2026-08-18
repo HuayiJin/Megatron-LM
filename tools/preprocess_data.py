@@ -21,6 +21,12 @@ except ImportError:
     PunktLanguageVars = object  # Fallback to the built-in object class
     nltk_available = False
 
+try:
+    import pyarrow.parquet as pq
+    parquet_available = True
+except ImportError:
+    parquet_available = False
+
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.arguments import _add_tokenizer_args
 from megatron.core.datasets import indexed_dataset
@@ -42,6 +48,54 @@ class CustomLanguageVars(PunktLanguageVars):
 class IdentitySplitter(object):
     def tokenize(self, *text):
         return text
+
+
+def is_parquet(file_name):
+    return file_name.endswith('.parquet')
+
+
+def expand_input_files(input_path):
+    """Expand input path to a list of files, handling directories and glob patterns."""
+    if os.path.isdir(input_path):
+        files = sorted(glob.glob(os.path.join(input_path, '*.parquet')) +
+                       glob.glob(os.path.join(input_path, '*.jsonl')) +
+                       glob.glob(os.path.join(input_path, '*.jsonl.gz')))
+        if not files:
+            raise FileNotFoundError(f"No parquet or jsonl files found in directory: {input_path}")
+        return files
+    elif '*' in input_path or '?' in input_path:
+        files = sorted(glob.glob(input_path))
+        if not files:
+            raise FileNotFoundError(f"No files matching pattern: {input_path}")
+        return files
+    else:
+        return [input_path]
+
+
+def iter_json_lines(file_names, json_keys):
+    """Yield json-encoded strings from jsonl or parquet files.
+
+    file_names can be a single file name (str) or a list of file names.
+    """
+    if isinstance(file_names, str):
+        file_names = [file_names]
+
+    for fname in file_names:
+        if is_parquet(fname):
+            if not parquet_available:
+                raise ImportError("pyarrow is required to read parquet files. Install with: pip install pyarrow")
+            pf = pq.ParquetFile(fname)
+            for batch in pf.iter_batches(batch_size=10000, columns=json_keys):
+                for row in batch.to_pylist():
+                    yield json.dumps(row, ensure_ascii=False)
+        else:
+            if fname.endswith('.gz'):
+                fin = gzip.open(fname, 'rt')
+            else:
+                fin = open(fname, 'r', encoding='utf-8')
+            for line in fin:
+                yield line
+            fin.close()
 
 
 class Encoder(object):
@@ -127,13 +181,15 @@ class Partition(object):
 
     def split_sentences(self, file_name):
         input_file_name, output_file_name = file_name
-        print("Opening", input_file_name)
-        fin = open(input_file_name, 'r', encoding='utf-8')
+        if isinstance(input_file_name, list):
+            print("Opening", len(input_file_name), "input files")
+        else:
+            print("Opening", input_file_name)
         fout = open(output_file_name, 'w')
 
         encoder = Encoder(self.args)
         pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
-        split_docs = pool.imap(encoder.split, fin, 32)
+        split_docs = pool.imap(encoder.split, iter_json_lines(input_file_name, self.args.json_keys), 32)
 
         proc_start = time.time()
         total_bytes_processed = 0
@@ -142,7 +198,6 @@ class Partition(object):
             fout.write(doc + "\n")
             self.print_processing_stats(i, proc_start, total_bytes_processed)
 
-        fin.close()
         fout.close()
 
         pool.close()
@@ -150,14 +205,16 @@ class Partition(object):
 
     def process_json_file(self, file_name):
         input_file_name, output_prefix = file_name
-        print("Opening", input_file_name)
-        fin = open(input_file_name, 'r', encoding='utf-8')
+        if isinstance(input_file_name, list):
+            print("Opening", len(input_file_name), "input files")
+        else:
+            print("Opening", input_file_name)
 
         startup_start = time.time()
         encoder = Encoder(self.args)
         tokenizer = build_tokenizer(self.args)
         pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
-        encoded_docs = pool.imap(encoder.encode, fin, 32)
+        encoded_docs = pool.imap(encoder.encode, iter_json_lines(input_file_name, self.args.json_keys), 32)
 
         level = "document"
         if self.args.split_sentences:
@@ -190,7 +247,6 @@ class Partition(object):
                     builders[key].add_document(doc[key], sentence_lens[key])
                 self.print_processing_stats(i, proc_start, total_bytes_processed)
 
-        fin.close()
         for key in self.args.json_keys:
             builders[key].finalize(output_idx_files[key])
 
@@ -205,7 +261,7 @@ def get_args():
     parser = _add_tokenizer_args(parser)
     group = parser.add_argument_group(title='input data')
     group.add_argument('--input', type=str, required=True,
-                       help='Path to input JSON')
+                       help='Path to input JSON/JSONL or Parquet (directory, glob, or single file)')
     group.add_argument('--json-keys', nargs='+', default=['text'],
                        help='space separate listed of keys to extract from json')
     group.add_argument('--split-sentences', action='store_true',
@@ -334,24 +390,31 @@ def main():
 
         in_ss_out_names = []
         if args.partitions == 1:
+            input_files = expand_input_files(args.input)
             file_name, extension = os.path.splitext(args.input)
             sentence_split_file = file_name + "_ss" + extension
             file_names = {
-                'partition': args.input,
+                'partition': input_files if len(input_files) > 1 else input_files[0],
                 'sentence_split': sentence_split_file,
                 'output_prefix': args.output_prefix}
             in_ss_out_names.append(file_names)
         else:
-            in_file_names = glob.glob(args.input)
+            in_file_names = expand_input_files(args.input)
 
-            # Count total number of lines across .jsonl files
+            # Count total number of lines across input files
             if args.keep_sequential_samples:
                 total_sample_count = 0
                 for filename in in_file_names:
-                    with open(filename, "r") as fin:
-                        for fc, _ in enumerate(fin):
-                            pass
-                    total_sample_count += (fc + 1)
+                    if is_parquet(filename):
+                        if not parquet_available:
+                            raise ImportError("pyarrow is required to read parquet files.")
+                        pf = pq.ParquetFile(filename)
+                        total_sample_count += pf.metadata.num_rows
+                    else:
+                        with open(filename, "r") as fin:
+                            for fc, _ in enumerate(fin):
+                                pass
+                        total_sample_count += (fc + 1)
                 partition_size = math.ceil(total_sample_count / args.partitions)
 
             # create .jsonl parition files
@@ -375,13 +438,9 @@ def main():
                 index = 0
                 if args.keep_sequential_samples: line_count = 0
                 for in_file_name in in_file_names:
-                    # support for gzip files
-                    if in_file_name.endswith(".gz"):
-                        fin = gzip.open(in_file_name, 'rt')
-                    else:
-                        fin = open(in_file_name, 'r', encoding='utf-8')
-
-                    for line in fin:
+                    for line in iter_json_lines(in_file_name, args.json_keys):
+                        if not line.endswith('\n'):
+                            line += '\n'
                         partitioned_input_files[index].write(line)
                         if args.keep_sequential_samples:
                             line_count += 1
@@ -389,8 +448,6 @@ def main():
                                 index += 1
                         else:
                             index = (index + 1)%args.partitions
-
-                    fin.close()
 
                 for idx in range(args.partitions):
                     partitioned_input_files[idx].close()

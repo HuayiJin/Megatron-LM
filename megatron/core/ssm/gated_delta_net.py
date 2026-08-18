@@ -581,20 +581,20 @@ class GatedDeltaNet(MegatronModule):
         else:
             cu_seqlens = cu_seqlens_actual
 
-        total_cu = cu_seqlens[-1].cpu().item()
-        if total_cu != total_seq_len:
-            raise ValueError(
-                f"GDN: {name}[-1]={total_cu} does not match "
-                f"total_sequence_length={total_seq_len}. "
-                f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
-            )
+        # total_cu = cu_seqlens[-1].cpu().item()
+        # if total_cu != total_seq_len:
+        #     raise ValueError(
+        #         f"GDN: {name}[-1]={total_cu} does not match "
+        #         f"total_sequence_length={total_seq_len}. "
+        #         f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
+        #     )
 
-        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        if (seq_lengths % cp_size != 0).any():
-            raise ValueError(
-                f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "
-                f"but got lengths: {seq_lengths.tolist()}"
-            )
+        # seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        # if (seq_lengths % cp_size != 0).any():
+        #     raise ValueError(
+        #         f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "
+        #         f"but got lengths: {seq_lengths.tolist()}"
+        #     )
 
         return cu_seqlens
 

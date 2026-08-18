@@ -2,10 +2,12 @@
 
 import logging
 import os
+import threading
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from math import ceil
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy
 import torch
@@ -76,6 +78,21 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     context_parallel_size: Optional[int] = None
     """The size of the context parallel group. Needed for padding in packed sequences."""
 
+    shuffle: bool = True
+    """Whether to shuffle the document and sample order. Set to False to read the dataset
+    strictly sequentially (in document/blend order), e.g. for debugging or deterministic
+    ordering requirements. Defaults to True to preserve existing behavior.
+    """
+
+    max_mmap_bin_files: Optional[int] = None
+    """Cap on the number of blended .bin files that may be memory-mapped concurrently
+    (only relevant when `mmap_bin_files` is True and `blend`/`blend_per_split` contains
+    many dataset prefixes). Datasets beyond this limit fall back to a plain file-reader
+    (mmap=False) for their .bin file, trading some read throughput for bounded virtual
+    memory usage, to avoid OOM on blends with a very large number of datasets.
+    None (default) means no cap: every dataset honors `mmap_bin_files` as-is.
+    """
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
@@ -96,6 +113,15 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
                 self.token_dtype_code is not None
             ), "Tokenizer vocab size is not set, deactivate --per-dataset-sequences-path or \
             fix the tokenizer."
+
+
+# Tracks, per-config (keyed by id(config)), how many of that config's blended .bin files
+# have already been granted a memory-mapping "slot" -- see GPTDataset._acquire_mmap_slot and
+# GPTDatasetConfig.max_mmap_bin_files. A plain dict keyed by id() is used (rather than storing
+# this mutable/lock-holding state directly on the dataclass) so that GPTDatasetConfig instances
+# remain trivially copyable/picklable.
+_MMAP_SLOT_LOCK = threading.Lock()
+_MMAP_SLOTS_USED: Dict[int, int] = defaultdict(int)
 
 
 class GPTDataset(MegatronDataset):
@@ -160,6 +186,36 @@ class GPTDataset(MegatronDataset):
         return low_level_dataset.sequence_lengths.shape[0]
 
     @staticmethod
+    def _acquire_mmap_slot(config: GPTDatasetConfig) -> bool:
+        """Decide whether the next low-level dataset built from `config` should be
+        memory-mapped, honoring `config.max_mmap_bin_files`.
+
+        Each call that returns True consumes one "slot" for the lifetime of `config`.
+        Once `max_mmap_bin_files` slots have been handed out, subsequent calls return
+        False so the caller falls back to a plain file-reader (mmap=False) instead of
+        memory-mapping the .bin file. This bounds the number of .bin files simultaneously
+        mmap'd for a single blend, which otherwise grows linearly with the number of
+        datasets in `blend`/`blend_per_split` and can exhaust virtual memory / trigger
+        OOM for very large blends.
+
+        Args:
+            config (GPTDatasetConfig): The config
+
+        Returns:
+            bool: Whether to mmap the next .bin file
+        """
+        if not config.mmap_bin_files:
+            return False
+        if config.max_mmap_bin_files is None:
+            return True
+        with _MMAP_SLOT_LOCK:
+            key = id(config)
+            if _MMAP_SLOTS_USED[key] < config.max_mmap_bin_files:
+                _MMAP_SLOTS_USED[key] += 1
+                return True
+        return False
+
+    @staticmethod
     def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> IndexedDataset:
         """Abstract method implementation
 
@@ -171,12 +227,13 @@ class GPTDataset(MegatronDataset):
         Returns:
             IndexedDataset: The underlying IndexedDataset
         """
+        mmap = GPTDataset._acquire_mmap_slot(config)
         if is_object_storage_path(dataset_path):
             assert config.object_storage_cache_path is not None
             return IndexedDataset(
                 dataset_path,
                 multimodal=False,
-                mmap=config.mmap_bin_files,
+                mmap=mmap,
                 object_storage_config=ObjectStorageConfig(
                     path_to_idx_cache=config.object_storage_cache_path
                 ),
@@ -187,7 +244,7 @@ class GPTDataset(MegatronDataset):
         return IndexedDataset(
             dataset_path,
             multimodal=False,
-            mmap=config.mmap_bin_files,
+            mmap=mmap,
             fast_cache_load=config.fast_cache_load,
             sequences_per_dataset=sequences_per_dataset,
             dtype_code=config.token_dtype_code,
@@ -221,6 +278,20 @@ class GPTDataset(MegatronDataset):
                     / self.config.sequence_length
                 )
         return self.sample_index.shape[0] - 1
+
+    @staticmethod
+    def _key_config_attributes() -> List[str]:
+        """Inherited method implementation
+
+        Adds ``shuffle`` to the base set of config attributes so that toggling it
+        (e.g. for sequential/non-shuffled reads) invalidates any on-disk index cache
+        built under the previous setting, rather than silently reusing stale
+        document/sample/shuffle indices.
+
+        Returns:
+            List[str]: The key config attributes
+        """
+        return MegatronDataset._key_config_attributes() + ["shuffle"]
 
     def __getitem__(self, idx: Optional[int]) -> Dict[str, torch.Tensor]:
         """Abstract method implementation
@@ -497,7 +568,7 @@ class GPTDataset(MegatronDataset):
 
             # Build the document index
             document_index = _build_document_index(
-                self.indices, num_epochs, numpy_random_state, separate_final_epoch
+                self.indices, num_epochs, numpy_random_state, separate_final_epoch, self.config.shuffle
             )
 
             # Build the sample index
@@ -534,11 +605,17 @@ class GPTDataset(MegatronDataset):
             # Build the shuffle index
             if separate_final_epoch:
                 shuffle_index = _build_shuffle_index(
-                    num_samples_sans_final_epoch, sample_index.shape[0] - 1, numpy_random_state
+                    num_samples_sans_final_epoch,
+                    sample_index.shape[0] - 1,
+                    numpy_random_state,
+                    self.config.shuffle,
                 )
             else:
                 shuffle_index = _build_shuffle_index(
-                    sample_index.shape[0] - 1, sample_index.shape[0] - 1, numpy_random_state
+                    sample_index.shape[0] - 1,
+                    sample_index.shape[0] - 1,
+                    numpy_random_state,
+                    self.config.shuffle,
                 )
 
             if path_to_cache:
@@ -642,6 +719,7 @@ def _build_document_index(
     num_epochs: int,
     numpy_random_state: numpy.random.RandomState,
     separate_final_epoch: bool,
+    shuffle: bool = True,
 ) -> numpy.ndarray:
     """Build an array with length = num epochs * num documents
 
@@ -654,6 +732,9 @@ def _build_document_index(
 
         separate_final_epoch (bool): Whether to exclude the last epoch from the global shuffle
 
+        shuffle (bool): Whether to shuffle the document index. When False, documents are kept
+            in their original (sequential) order across epochs. Defaults to True.
+
     Returns:
         numpy.ndarray: The document index
     """
@@ -663,16 +744,22 @@ def _build_document_index(
         document_index[:] = documents
         document_index = document_index.reshape(-1)
         document_index = document_index.astype(numpy.int32)
-        numpy_random_state.shuffle(document_index)
+        if shuffle:
+            numpy_random_state.shuffle(document_index)
         return document_index
 
-    doc_idx_first = _build_document_index(documents, num_epochs - 1, numpy_random_state, False)
-    doc_idx_last = _build_document_index(documents, 1, numpy_random_state, False)
+    doc_idx_first = _build_document_index(
+        documents, num_epochs - 1, numpy_random_state, False, shuffle
+    )
+    doc_idx_last = _build_document_index(documents, 1, numpy_random_state, False, shuffle)
     return numpy.concatenate((doc_idx_first, doc_idx_last))
 
 
 def _build_shuffle_index(
-    num_samples: int, total_size: int, numpy_random_state: numpy.random.RandomState
+    num_samples: int,
+    total_size: int,
+    numpy_random_state: numpy.random.RandomState,
+    shuffle: bool = True,
 ) -> numpy.ndarray:
     """Build the range [0, size) and shuffle
 
@@ -684,6 +771,9 @@ def _build_shuffle_index(
 
         numpy_random_state (numpy.random.RandomState): The NumPy random state
 
+        shuffle (bool): Whether to shuffle the index ranges. When False, the identity
+            permutation (sequential order) is returned instead. Defaults to True.
+
     Returns:
         numpy.ndarray: The shuffle index
     """
@@ -693,12 +783,14 @@ def _build_shuffle_index(
         dtype_ = numpy.int64
 
     shuffle_idx_first = numpy.arange(start=0, stop=num_samples, step=1, dtype=dtype_)
-    numpy_random_state.shuffle(shuffle_idx_first)
+    if shuffle:
+        numpy_random_state.shuffle(shuffle_idx_first)
     if num_samples == total_size:
         return shuffle_idx_first
 
     shuffle_idx_last = numpy.arange(start=num_samples, stop=total_size, step=1, dtype=dtype_)
-    numpy_random_state.shuffle(shuffle_idx_last)
+    if shuffle:
+        numpy_random_state.shuffle(shuffle_idx_last)
 
     return numpy.concatenate((shuffle_idx_first, shuffle_idx_last))
 
