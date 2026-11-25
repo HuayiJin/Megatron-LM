@@ -150,7 +150,11 @@ class StudentLogitsCapture:
         if not module.training:
             return
         # NOTE: Assumes main head runs after MTP layers, overwriting this value prior to pop().
-        self._logits = output[0] if isinstance(output, tuple) else output
+        logits = output[0] if isinstance(output, tuple) else output
+        # Some LM cross-entropy backends overwrite logits before the KD forward. KD also
+        # normalizes FP32 logits in place, which can affect tensors saved for LM backward.
+        # Give KD its own storage while preserving gradients to the output layer.
+        self._logits = logits.clone()
 
     def pop(self) -> torch.Tensor:
         """Return captured logits and clear the reference for the next forward."""
