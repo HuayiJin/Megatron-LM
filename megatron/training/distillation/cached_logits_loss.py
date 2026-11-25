@@ -150,7 +150,13 @@ class StudentLogitsCapture:
         if not module.training:
             return
         # NOTE: Assumes main head runs after MTP layers, overwriting this value prior to pop().
-        self._logits = output[0] if isinstance(output, tuple) else output
+        logits = output[0] if isinstance(output, tuple) else output
+        # The model computes its LM loss from these same logits before the loss function
+        # pops them, and the cross entropy targets consume their input in place (see
+        # megatron/core/ops/loss/backends.py): native CE turns fp32 logits into the softmax,
+        # TE CE (overwrite_input=True) writes the gradient into them in any dtype. Keep a
+        # differentiable copy so the KD loss sees the logits the output layer produced.
+        self._logits = logits.clone()
 
     def pop(self) -> torch.Tensor:
         """Return captured logits and clear the reference for the next forward."""
