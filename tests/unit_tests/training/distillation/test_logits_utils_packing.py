@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from megatron.training.distillation.utils import (
+    index_high_bits_for_vocab,
     pad_and_stack_cu_seqlens,
     reassemble_cp_sequence,
     slice_tensor_for_cp_rank,
@@ -69,6 +70,62 @@ def test_unpack_indices_v1_legacy():
     bit_17 = (indices >> 16).bool()
     restored = unpack_indices(low_bits, bit_17)
     assert torch.equal(restored, indices)
+
+
+# ---------------------------------------------------------------------------
+# v2 index packing for vocabularies above 2**17
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "vocab_size,expected",
+    [(1, 1), (32_000, 1), (2**17, 1), (2**17 + 1, 2), (151_936, 2), (262_144, 2), (2**20, 4)],
+)
+def test_index_high_bits_for_vocab(vocab_size, expected):
+    assert index_high_bits_for_vocab(vocab_size) == expected
+
+
+def test_index_high_bits_for_vocab_rejects_unrepresentable_sizes():
+    with pytest.raises(ValueError):
+        index_high_bits_for_vocab(0)
+    with pytest.raises(ValueError, match="exceeds the maximum"):
+        index_high_bits_for_vocab(2**31 + 1)
+
+
+def test_v2_pack_indices_single_plane_matches_original_layout():
+    """num_high_bits=1 must keep existing v2 payloads byte-identical."""
+    torch.manual_seed(3)
+    indices = torch.randint(0, 2**17, (5, 3, 7), dtype=torch.long)
+    indices[0, 0, 0] = -1  # CACHED_LOGITS_INDEX_SENTINEL
+    low_bits, packed = v2_pack_indices(indices)
+    legacy_packed = torch.from_numpy(np.packbits((indices >> 16).to(torch.uint8).reshape(-1).numpy()))
+    assert torch.equal(low_bits, (indices & 0xFFFF).to(torch.uint16))
+    assert torch.equal(packed, legacy_packed)
+
+
+@pytest.mark.parametrize("vocab_size", [151_936, 248_320, 262_144, 2**20])
+def test_v2_pack_unpack_round_trip_large_vocab(vocab_size):
+    torch.manual_seed(4)
+    num_high_bits = index_high_bits_for_vocab(vocab_size)
+    indices = torch.randint(0, vocab_size, (6, 2, 33), dtype=torch.long)
+    indices[0, 0, :4] = torch.tensor([0, 2**16 - 1, 2**17, vocab_size - 1])
+    low_bits, packed = v2_pack_indices(indices, num_high_bits=num_high_bits)
+    assert packed.numel() == num_high_bits * ((indices.numel() + 7) // 8)
+    assert torch.equal(v2_unpack_indices(low_bits, packed, num_high_bits=num_high_bits), indices)
+
+
+def test_v2_pack_indices_rejects_indices_that_do_not_fit():
+    """Indices >= 2**17 used to be silently truncated by the 17-bit layout."""
+    indices = torch.tensor([[[151_935]]], dtype=torch.long)
+    with pytest.raises(ValueError, match="does not fit"):
+        v2_pack_indices(indices)
+
+
+def test_v2_unpack_indices_rejects_mismatched_plane_count():
+    indices = torch.randint(0, 262_144, (4, 1, 9), dtype=torch.long)
+    low_bits, packed = v2_pack_indices(indices, num_high_bits=2)
+    with pytest.raises(ValueError, match="expected"):
+        v2_unpack_indices(low_bits, packed)
 
 
 # ---------------------------------------------------------------------------

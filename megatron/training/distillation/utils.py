@@ -536,9 +536,39 @@ def unpack_indices(low_bits: torch.Tensor, bit_17: torch.Tensor) -> torch.Tensor
     return (bit_17.long() << 16) | low_bits.long()
 
 
-def v2_pack_indices(indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+INDEX_LOW_BITS = 16
+"""Number of index bits stored in the ``indices_low`` uint16 tensor."""
+
+MAX_INDEX_HIGH_BITS = 15
+"""Upper bound on the bit-packed high bits, i.e. global vocab sizes up to ``2**31``."""
+
+
+def index_high_bits_for_vocab(vocab_size: int) -> int:
+    """Number of bit-packed high bits needed above ``indices_low`` for ``vocab_size``.
+
+    At least 1, so vocabularies up to ``2**17`` keep the original v2 layout byte for byte.
+    """
+    if vocab_size < 1:
+        raise ValueError(f"vocab_size must be positive, got {vocab_size}")
+    high_bits = max(1, (vocab_size - 1).bit_length() - INDEX_LOW_BITS)
+    if high_bits > MAX_INDEX_HIGH_BITS:
+        raise ValueError(
+            f"Global vocab size {vocab_size} exceeds the maximum supported "
+            f"{2 ** (INDEX_LOW_BITS + MAX_INDEX_HIGH_BITS)}"
+        )
+    return high_bits
+
+
+def v2_pack_indices(
+    indices: torch.Tensor, num_high_bits: int = 1
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Split full-iteration v2 monolith indices into uint16 lower bits +
-    bit-packed 17th bit.
+    bit-packed high bits.
+
+    The bits above the lower 16 are stored as ``num_high_bits`` bit planes,
+    each bit-packed with ``numpy.packbits`` (1 bit/element) and concatenated
+    in order of significance (bit 16 first). With the default
+    ``num_high_bits=1`` this is exactly the original v2 17th-bit layout.
 
     Must be called on the already-concatenated per-iteration monolith, not
     per-microbatch: splitting off ``low_bits`` is elementwise and would
@@ -547,29 +577,55 @@ def v2_pack_indices(indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     concatenating the packed bytes would *not* reproduce the same bytes as
     packing the concatenated monolith once. Both steps are therefore done
     together here, at the monolith level, to match :func:`v2_unpack_indices`.
+
+    Raises ``ValueError`` if an index needs more than ``16 + num_high_bits``
+    bits, instead of silently truncating it.
     """
+    if not 1 <= num_high_bits <= MAX_INDEX_HIGH_BITS:
+        raise ValueError(f"num_high_bits must be in [1, {MAX_INDEX_HIGH_BITS}], got {num_high_bits}")
+    if indices.numel() > 0:
+        limit = 1 << (INDEX_LOW_BITS + num_high_bits)
+        max_index = int(indices.max())
+        if max_index >= limit:
+            raise ValueError(
+                f"Index {max_index} does not fit in {INDEX_LOW_BITS + num_high_bits} bits; "
+                f"pass num_high_bits=index_high_bits_for_vocab(vocab_size)."
+            )
     low_bits = (indices & 0xFFFF).to(torch.uint16)
-    bit_17 = (indices >> 16).to(torch.uint8)
-    packed_bit_17 = torch.from_numpy(np.packbits(bit_17.reshape(-1).numpy()))
-    return low_bits, packed_bit_17
+    high = (indices >> INDEX_LOW_BITS).reshape(-1)
+    planes = [
+        np.packbits(((high >> bit) & 1).to(torch.uint8).numpy()) for bit in range(num_high_bits)
+    ]
+    packed_high_bits = torch.from_numpy(np.concatenate(planes))
+    return low_bits, packed_high_bits
 
 
-def v2_unpack_indices(low_bits: torch.Tensor, packed_bit_17: torch.Tensor) -> torch.Tensor:
-    """Reconstruct v2 monolith indices from uint16 lower bits + bit-packed 17th bit.
+def v2_unpack_indices(
+    low_bits: torch.Tensor, packed_high_bits: torch.Tensor, num_high_bits: int = 1
+) -> torch.Tensor:
+    """Reconstruct v2 monolith indices from uint16 lower bits + bit-packed high bits.
 
-    ``packed_bit_17`` is a 1-D uint8 tensor produced by ``numpy.packbits`` over
-    the flattened 17th-bit flags (1 bit/element, instead of ``torch.bool``'s
-    1 byte/element). Unlike v1's list-of-microbatches payload, v2 stores one
-    monolith per iteration, so ``low_bits`` already carries the full
-    ``(seq, samples_per_dp_per_iter, K)`` shape needed to reshape the unpacked
-    bits -- no separate shape field is required.
+    ``packed_high_bits`` is a 1-D uint8 tensor produced by
+    :func:`v2_pack_indices`: ``num_high_bits`` bit planes, each packed with
+    ``numpy.packbits`` over the flattened elements (1 bit/element, instead of
+    ``torch.bool``'s 1 byte/element). Unlike v1's list-of-microbatches payload,
+    v2 stores one monolith per iteration, so ``low_bits`` already carries the
+    full ``(seq, samples_per_dp_per_iter, K)`` shape needed to reshape the
+    unpacked bits -- no separate shape field is required.
     """
-    bit_17 = (
-        torch.from_numpy(np.unpackbits(packed_bit_17.numpy(), count=low_bits.numel()))
-        .reshape(low_bits.shape)
-        .long()
-    )
-    return (bit_17 << 16) | low_bits.long()
+    numel = low_bits.numel()
+    plane_bytes = (numel + 7) // 8
+    if packed_high_bits.numel() != num_high_bits * plane_bytes:
+        raise ValueError(
+            f"Packed high bits hold {packed_high_bits.numel()} bytes, expected "
+            f"{num_high_bits * plane_bytes} for {numel} indices with {num_high_bits} high bit(s)."
+        )
+    packed = packed_high_bits.numpy()
+    high = torch.zeros(numel, dtype=torch.long)
+    for bit in range(num_high_bits):
+        plane = packed[bit * plane_bytes : (bit + 1) * plane_bytes]
+        high |= torch.from_numpy(np.unpackbits(plane, count=numel)).long() << bit
+    return (high.reshape(low_bits.shape) << INDEX_LOW_BITS) | low_bits.long()
 
 
 class LogprobsTarEntry(NamedTuple):
@@ -848,7 +904,15 @@ def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any, Optional[torch.Tenso
     tensors = torch.load(io.BytesIO(data), weights_only=True)
     if tensors.get("format_version", 1) >= 2:
         values = tensors["values"]
-        indices = v2_unpack_indices(tensors["indices_low"], tensors["bit_17"])
+        if "index_high_planes" in tensors:
+            # Vocabularies above 2**17 (see LogitsSaverHooks._buffer_iteration).
+            indices = v2_unpack_indices(
+                tensors["indices_low"],
+                tensors["index_high_planes"],
+                num_high_bits=int(tensors["index_high_bits"]),
+            )
+        else:
+            indices = v2_unpack_indices(tensors["indices_low"], tensors["bit_17"])
         return values, indices, tensors.get("cu_seqlens_padded")
     # ---- v1 LEGACY (remove with LegacyTeacherTarDataset) ----
     indices_list = [

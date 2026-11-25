@@ -19,10 +19,14 @@ For efficient global top-K log-prob computation across TP ranks:
 - TP rank 0 saves the full top-K log-probabilities (unsharded)
 
 Index storage optimization:
-- Global vocab requires 17 bits, so we store lower 16 bits as uint16
-- The 17th bit is stored separately, bit-packed 1 bit/element (not torch.bool,
-  which is 1 byte/element) via v2_pack_indices/v2_unpack_indices
-- To reconstruct: global_index = (bit_17 << 16) | low_16_bits
+- The lower 16 bits of each global vocab index are stored as uint16
+- The remaining high bits are stored separately, bit-packed 1 bit/element per
+  bit plane (not torch.bool, which is 1 byte/element) via
+  v2_pack_indices/v2_unpack_indices
+- Vocabularies up to 2**17 use a single plane, stored as ``bit_17`` exactly as
+  before; larger vocabularies (e.g. 151,936 or 262,144) store
+  ``index_high_bits`` planes as ``index_high_planes``
+- To reconstruct: global_index = (high_bits << 16) | low_16_bits
 """
 
 import io
@@ -60,6 +64,7 @@ from megatron.training.distillation.utils import (
     compute_dataset_hash,
     get_consumed_train_samples,
     get_current_iteration,
+    index_high_bits_for_vocab,
     is_packed_sequence_run,
     is_remote_storage_path,
     open_logit_file,
@@ -108,8 +113,6 @@ def check_logits_saver_failure() -> None:
             "with a stalled logits-saver worker."
         )
 
-
-_MAX_VOCAB_SIZE = 2 ** 17  # 131072 - maximum supported vocab size
 
 class LogitsSaverHooks:
     """
@@ -300,6 +303,10 @@ class LogitsSaverHooks:
         # Top-P logging: per-microbatch kept counts (populated by _apply_topp_truncation)
         self._topp_kept_counts: List[float] = []
 
+        # Bit-packed index bits above the lower 16, set from the global vocab size
+        # in _process_single_microbatch (1 keeps the original 17-bit v2 layout).
+        self._index_high_bits = 1
+
         # Set by the async worker process (via _write_batched_tar's failure_event
         # arg) if a background write hits an unrecoverable error; the worker's
         # completion queue only reports "done", never "failed", so this is the
@@ -450,12 +457,14 @@ class LogitsSaverHooks:
 
         if all_values:
             values_tensor = torch.cat(all_values, dim=1)
-            # v2_pack_indices bit-packs the 17th bit, which must happen on the
+            # v2_pack_indices bit-packs the high index bits, which must happen on the
             # full per-iteration monolith (see its docstring) -- so indices are
             # concatenated across microbatches *before* splitting/packing here,
             # rather than packed per-microbatch and concatenated after.
             indices_tensor = torch.cat(all_indices, dim=1)
-            indices_low_tensor, bit_17_tensor = v2_pack_indices(indices_tensor)
+            indices_low_tensor, bit_17_tensor = v2_pack_indices(
+                indices_tensor, num_high_bits=self._index_high_bits
+            )
             # Document boundaries, if this run has any (--sft), stacked into
             # one (samples_per_dp_per_iter, max_boundaries) tensor matching
             # the values/indices monolith's sample dim. --sft is a run-wide
@@ -473,7 +482,11 @@ class LogitsSaverHooks:
             else:
                 cu_seqlens_padded_tensor = None
             self._buffer_iteration(
-                values_tensor, indices_low_tensor, bit_17_tensor, cu_seqlens_padded_tensor
+                values_tensor,
+                indices_low_tensor,
+                bit_17_tensor,
+                cu_seqlens_padded_tensor,
+                index_high_bits=self._index_high_bits,
             )
 
         if self._topp_kept_counts:
@@ -509,9 +522,8 @@ class LogitsSaverHooks:
         local_vocab_size = logits.shape[-1]
         global_vocab_size = local_vocab_size * self.tp_size
 
-        assert global_vocab_size <= _MAX_VOCAB_SIZE, (
-            f"Global vocab size {global_vocab_size} exceeds maximum supported {_MAX_VOCAB_SIZE} (17 bits)"
-        )
+        # Raises for vocabularies the on-disk index encoding cannot represent.
+        self._index_high_bits = index_high_bits_for_vocab(global_vocab_size)
 
         effective_k = min(self.k, global_vocab_size)
         local_k = min(effective_k, local_vocab_size)
@@ -736,6 +748,7 @@ class LogitsSaverHooks:
         indices_low_tensor: torch.Tensor,
         bit_17_tensor: torch.Tensor,
         cu_seqlens_padded_tensor: Optional[torch.Tensor] = None,
+        index_high_bits: int = 1,
     ) -> None:
         """Serialize a per-iteration monolith and buffer for async flush.
 
@@ -747,7 +760,14 @@ class LogitsSaverHooks:
           tensor (lower 16 bits of vocab indices)
         - ``bit_17``: 1-D uint8 tensor, the 17th bit of every index in
           ``indices_low`` bit-packed via ``numpy.packbits`` (see
-          :func:`~megatron.training.distillation.utils.v2_pack_indices`)
+          :func:`~megatron.training.distillation.utils.v2_pack_indices`).
+          Written only when ``index_high_bits == 1`` (vocab <= 2**17), so
+          those payloads are unchanged.
+        - ``index_high_planes`` / ``index_high_bits``: written instead of
+          ``bit_17`` for larger vocabularies: ``index_high_bits`` bit-packed
+          planes holding the bits above the lower 16. Readers without this
+          support fail on the missing ``bit_17`` key instead of decoding
+          truncated indices.
         - ``cu_seqlens_padded``: optional ``(samples_per_dp_per_iter,
           max_boundaries)`` int tensor of per-sample document boundaries
           (only present for ``--sft`` / packed runs); ``None`` otherwise.
@@ -769,14 +789,19 @@ class LogitsSaverHooks:
         free.  ``end_sample`` matches how ``training.py`` itself computes
         the current global batch size.
         """
-        buffer = io.BytesIO()
-        torch.save({
+        payload = {
             'values': values_tensor,
             'indices_low': indices_low_tensor,
-            'bit_17': bit_17_tensor,
             'cu_seqlens_padded': cu_seqlens_padded_tensor,
             'format_version': LOGPROBS_FORMAT_VERSION,
-        }, buffer)
+        }
+        if index_high_bits == 1:
+            payload['bit_17'] = bit_17_tensor
+        else:
+            payload['index_high_planes'] = bit_17_tensor
+            payload['index_high_bits'] = index_high_bits
+        buffer = io.BytesIO()
+        torch.save(payload, buffer)
         data = buffer.getvalue()
         start_sample = get_consumed_train_samples()
         end_sample = start_sample + get_num_microbatches() * self.dp_size * self._micro_batch_size
